@@ -2387,13 +2387,11 @@ impl PlaybackNetwork for Network {
     let app = Arc::clone(&self.app);
     tokio::spawn(async move {
       tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-      let app = app.lock().await;
+      let mut app = app.lock().await;
       if app.playback_owner() != PlaybackOwner::Spotify {
         return;
       }
-      if let Some(io_tx) = app.io_tx_clone() {
-        let _ = io_tx.send(IoEvent::PreviousTrack);
-      }
+      app.dispatch_automatic(IoEvent::PreviousTrack);
     });
   }
 

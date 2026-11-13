@@ -226,6 +226,81 @@ impl App {
     }
   }
 
+  /// Identify the slot whose end-of-track latch a deferred advance owns.
+  #[cfg(feature = "qobuz")]
+  pub(crate) fn queue_advance_fetch_id(&self) -> Option<u64> {
+    match self.queue_now.as_ref()? {
+      QueueNowPlaying::Decoded(slot) => Some(slot.fetch_id),
+      #[cfg(feature = "streaming")]
+      QueueNowPlaying::Spotify { .. } => None,
+    }
+  }
+
+  pub(super) fn bump_queue_suspension_generation(&mut self) {
+    #[cfg(feature = "qobuz")]
+    {
+      self.queue_suspension_generation = self.queue_suspension_generation.wrapping_add(1);
+    }
+  }
+
+  #[cfg(feature = "qobuz")]
+  pub(crate) fn queue_suspension_generation(&self) -> u64 {
+    self.queue_suspension_generation
+  }
+
+  /// Cancel a stale deferred advance without changing a replacement slot or
+  /// replaying playback from an old login or user decision.
+  #[cfg(feature = "qobuz")]
+  pub(crate) fn release_queue_advance(
+    &mut self,
+    fetch_id: Option<u64>,
+    suspension_generation: u64,
+  ) {
+    if self.queue_suspension_generation != suspension_generation {
+      return;
+    }
+    if let Some(fetch_id) = fetch_id {
+      if let Some(QueueNowPlaying::Decoded(slot)) = self.queue_now.as_mut() {
+        if slot.fetch_id == fetch_id {
+          slot.advancing = false;
+        }
+      }
+      return;
+    }
+    if self.queue_now.is_some() {
+      return;
+    }
+    // A context-to-queue handoff latches the context before there is a slot.
+    // A newer deferred advance inherits that latch instead of cancelling it.
+    use crate::core::queue::SuspendedContext;
+    match self.queue_suspended.take() {
+      #[cfg(feature = "local-files")]
+      Some(SuspendedContext::Local { .. }) => {
+        if let Some(session) = self.local_playback.as_mut() {
+          session.advancing = false;
+        }
+      }
+      #[cfg(feature = "subsonic")]
+      Some(SuspendedContext::Subsonic { .. }) => {
+        if let Some(session) = self.subsonic_playback.as_mut() {
+          session.advancing = false;
+        }
+      }
+      #[cfg(feature = "youtube")]
+      Some(SuspendedContext::YouTube { .. }) => {
+        if let Some(session) = self.youtube_playback.as_mut() {
+          session.advancing = false;
+        }
+      }
+      Some(SuspendedContext::Qobuz { .. }) => {
+        if let Some(session) = self.qobuz_playback.as_mut() {
+          session.advancing = false;
+        }
+      }
+      _ => {}
+    }
+  }
+
   /// The track currently playing through the queue slot, if any. Used by
   /// persistence to prepend it back onto the saved queue so a mid-queue quit
   /// doesn't lose the in-flight track.
@@ -284,7 +359,7 @@ impl App {
       self.spotify_queue_guard_reloads = 0;
       self.pause_native_playback();
       self.song_progress_ms = 0;
-      self.dispatch(IoEvent::AdvanceNativeQueue);
+      self.dispatch_automatic(IoEvent::AdvanceNativeQueue);
       return true;
     }
     if self.queue_owns_playback() || !self.native_should_drive() {
@@ -297,7 +372,7 @@ impl App {
       // queue slot takes the sink.
       self.pause_native_playback();
       self.song_progress_ms = 0;
-      self.dispatch(IoEvent::AdvanceNativeQueue);
+      self.dispatch_automatic(IoEvent::AdvanceNativeQueue);
       return true;
     }
     false
@@ -343,6 +418,46 @@ impl App {
 mod tests {
   use super::*;
   use crate::core::app::test_support::*;
+
+  #[cfg(feature = "qobuz")]
+  #[test]
+  fn cancelling_a_queue_handoff_releases_the_suspended_context_latch() {
+    use crate::infra::audio::LocalPlayer;
+    use crate::infra::qobuz::{QobuzPlaybackState, QobuzSource};
+
+    let mut app = make_app_simple();
+    app.qobuz_playback = Some(QobuzPlaybackState {
+      player: Arc::new(LocalPlayer::without_device()),
+      source: Arc::new(QobuzSource::new("fixture", "fixture", "fixture")),
+      tracks: vec![queue_track(Some("qobuz:track:1"), "Ended")],
+      index: 0,
+      advancing: false,
+      tempfile: None,
+      complete: Default::default(),
+      quality: None,
+      shuffle_backup: None,
+      fetch_id: 1,
+      resume_at: None,
+      fetch: None,
+    });
+    app.suspend_active_decoded_context_for_skip(crate::infra::queue::SuspendCause::AutoAdvance);
+    assert!(app.qobuz_playback.as_ref().unwrap().advancing);
+    assert!(app.queue_suspended.is_some());
+
+    let generation = app.queue_suspension_generation();
+    app.suspend_active_decoded_context_for_skip(crate::infra::queue::SuspendCause::AutoAdvance);
+    app.release_queue_advance(None, generation);
+    assert!(app.qobuz_playback.as_ref().unwrap().advancing);
+    assert!(
+      app.queue_suspended.is_some(),
+      "a newer handoff must survive"
+    );
+
+    app.release_queue_advance(None, app.queue_suspension_generation());
+
+    assert!(!app.qobuz_playback.as_ref().unwrap().advancing);
+    assert!(app.queue_suspended.is_none());
+  }
 
   #[test]
   fn add_track_to_native_queue_pushes_normal_track() {
@@ -460,7 +575,10 @@ mod tests {
         .is_none(),
       "an empty slot must never reissue the finished track"
     );
-    assert!(matches!(rx.recv().unwrap(), IoEvent::AdvanceNativeQueue));
+    assert!(matches!(
+      app.prepare_playback_event(rx.recv().unwrap()),
+      IoEvent::AdvanceNativeQueue
+    ));
   }
 
   #[cfg(feature = "streaming")]

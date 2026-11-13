@@ -511,7 +511,7 @@ impl Driver {
                   paused,
                 });
               }
-              $app.dispatch(IoEvent::ReplayCurrentTrack);
+              $app.dispatch_automatic(IoEvent::ReplayCurrentTrack);
               $app.set_status_message(
                 if paused {
                   $app.strings().status.app.audio_device_paused
@@ -598,7 +598,7 @@ impl Driver {
             if paused {
               app.queue_slot_desired_playing = false;
             }
-            app.dispatch(IoEvent::FinishNativeQueue);
+            app.dispatch_automatic(IoEvent::FinishNativeQueue);
             app.set_status_message(app.strings().status.infra.audio_disconnected, 8);
           }
           Reopen::Waiting => {}
@@ -622,7 +622,7 @@ impl Driver {
         _ => false,
       };
       if advance {
-        app.dispatch(IoEvent::AdvanceNativeQueue);
+        app.dispatch_automatic(IoEvent::AdvanceNativeQueue);
       }
     }
 
@@ -681,7 +681,7 @@ impl Driver {
               if let Some(s) = $app.$playback.as_mut() {
                 s.advancing = true; // atomic check-and-set: one dispatch only
               }
-              $app.dispatch(if replay {
+              $app.dispatch_automatic(if replay {
                 IoEvent::ReplayCurrentTrack
               } else {
                 IoEvent::NextTrack
@@ -693,7 +693,7 @@ impl Driver {
               $app.suspend_active_decoded_context_for_skip(
                 crate::infra::queue::SuspendCause::AutoAdvance,
               );
-              $app.dispatch(IoEvent::AdvanceNativeQueue);
+              $app.dispatch_automatic(IoEvent::AdvanceNativeQueue);
             }
             Some(plan::DecodedAdvance::Teardown) => {
               $app.$playback = None;

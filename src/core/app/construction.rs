@@ -79,6 +79,8 @@ impl Default for App {
       queue: None,
       native_queue: Vec::new(),
       queue_suspended: None,
+      #[cfg(feature = "qobuz")]
+      queue_suspension_generation: 0,
       #[cfg(feature = "queue")]
       queue_now: None,
       #[cfg(feature = "streaming")]
@@ -120,6 +122,7 @@ impl Default for App {
       clipboard: Clipboard::new().ok(),
       is_loading: false,
       io_tx: None,
+      playback_intent_generation: 0,
       is_fetching_current_playback: false,
       spotify_connected: false,
       pending_keybinding_persist: None,

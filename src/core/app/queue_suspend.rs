@@ -15,6 +15,7 @@ impl App {
     #[cfg_attr(not(feature = "audio-decode-queue"), allow(unused_variables))]
     cause: crate::infra::queue::SuspendCause,
   ) {
+    self.bump_queue_suspension_generation();
     // `resume_index_after_queue` applies the per-mode wrap/clamp: Repeat All
     // wraps at the end (last -> first) so a skip at the final track resumes the
     // first one rather than reading as exhausted (`None`); Repeat One resumes
@@ -92,6 +93,7 @@ impl App {
   /// *same* track at its live position) — the Enter-jump path. Radio has no
   /// seekable position, so it is stashed for reconnect like the skip path.
   pub(crate) fn suspend_active_decoded_context_mid_track(&mut self) {
+    self.bump_queue_suspension_generation();
     #[cfg(feature = "local-files")]
     #[allow(clippy::needless_return)]
     if let Some(local) = self.local_playback.as_mut() {
@@ -165,6 +167,7 @@ impl App {
     &mut self,
     cause: crate::infra::queue::SuspendCause,
   ) {
+    self.bump_queue_suspension_generation();
     // A client-side shuffle session resumes by index into its app-owned order
     // (no context reload, no reshuffle) — the whole point of the session is
     // that a queue interruption cannot regenerate the remaining shuffle order.
@@ -295,6 +298,7 @@ impl App {
     if !self.is_native_streaming_active_for_playback() && !self.native_parked_here() {
       return;
     }
+    self.bump_queue_suspension_generation();
     // Mid-track semantics for a client-side shuffle session: resume the track
     // that was playing, at its position in the app-owned order.
     if let Some(session) = self.native_spotify_shuffle.as_ref() {

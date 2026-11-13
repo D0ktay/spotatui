@@ -46,6 +46,8 @@ use self::utils::UtilsNetwork;
 // clean while the feature is silently absent.
 #[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub enum IoEvent {
+  /// Playback continuation, unwrapped by the pump before source routing.
+  AutomaticPlayback(Box<IoEvent>),
   GetCurrentPlayback,
   /// After a track transition (e.g., EndOfTrack), ensure we don't end up paused on the next item.
   /// The payload is the previous track identifier (either base62 id or a `spotify:track:` URI).
@@ -744,6 +746,8 @@ impl Network {
     }
 
     match io_event {
+      // The pump unwraps automatic playback before routing to any handler.
+      IoEvent::AutomaticPlayback(_) => {}
       IoEvent::EnsurePlaybackContinues(previous_track_id) => {
         self.ensure_playback_continues(previous_track_id).await;
       }
@@ -1298,7 +1302,11 @@ impl Network {
         }
         continue;
       }
-      let _ = io_tx.send(event);
+      if Self::event_is_transport(&event) {
+        self.app.lock().await.dispatch_automatic(event);
+      } else {
+        let _ = io_tx.send(event);
+      }
     }
   }
 
@@ -1907,7 +1915,7 @@ impl Network {
     // Track change takes priority
     let switched_track = current_uri != track_uri;
     if switched_track {
-      app.start_playback_uris(vec![track_uri], None);
+      app.dispatch_automatic(IoEvent::StartPlayback(None, Some(vec![track_uri]), None));
     }
 
     // Play/pause sync
@@ -1915,9 +1923,9 @@ impl Network {
     // begin playing even when host is paused.
     if (switched_track && !is_playing) || (!switched_track && current_is_playing != is_playing) {
       if is_playing {
-        app.dispatch(IoEvent::StartPlayback(None, None, None));
+        app.dispatch_automatic(IoEvent::StartPlayback(None, None, None));
       } else {
-        app.dispatch(IoEvent::PausePlayback);
+        app.dispatch_automatic(IoEvent::PausePlayback);
       }
     }
 
@@ -2484,6 +2492,45 @@ mod tests {
       .is_some_and(|m| m.contains("rate limit")));
   }
 
+  #[cfg(feature = "qobuz")]
+  #[tokio::test]
+  async fn rate_limit_replays_preserve_the_pending_playback_intent() {
+    for event in [
+      IoEvent::StartPlayback(Some("spotify:playlist:earlier".into()), None, None),
+      IoEvent::PausePlayback,
+      IoEvent::NextTrack,
+      IoEvent::PreviousTrack,
+      IoEvent::ForcePreviousTrack,
+      IoEvent::ResumeSpotifyContext(None, None),
+      IoEvent::ResumeNativeShuffleSession(None, 0),
+      IoEvent::ReshuffleNativeShuffleLap,
+    ] {
+      let (app, rx) = app_with_a_session_and_channel();
+      let mut network = rate_limited_pump_network(&app).await;
+      app.lock().await.note_playback_intent(&event);
+      assert!(network.hold_back_if_rate_limited(event).await.is_none());
+      let intent = {
+        let mut guard = app.lock().await;
+        guard.dispatch(IoEvent::StartPlayback(
+          Some("qobuz:track:waiting".into()),
+          None,
+          None,
+        ));
+        guard.prepare_playback_event(rx.try_recv().unwrap());
+        guard.playback_intent_generation()
+      };
+
+      network.flush_deferred().await;
+
+      let mut guard = app.lock().await;
+      let event = rx.try_recv().unwrap();
+      assert!(matches!(event, IoEvent::AutomaticPlayback(_)));
+      guard.prepare_playback_event(event);
+      assert_eq!(guard.playback_intent_generation(), intent);
+      assert!(rx.try_recv().is_err());
+    }
+  }
+
   #[cfg(feature = "streaming")]
   #[tokio::test]
   async fn a_held_back_transport_event_is_dropped_when_the_sink_changed_hands() {
@@ -2694,10 +2741,49 @@ mod tests {
     relay(&mut network, host_state()).await;
 
     assert!(matches!(
-      rx.try_recv(),
-      Ok(IoEvent::StartPlayback(None, Some(uris), None)) if uris == [HOST_TRACK]
+      app.lock().await.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(None, Some(uris), None) if uris == [HOST_TRACK]
     ));
     assert!(rx.try_recv().is_err());
+  }
+
+  #[cfg(feature = "qobuz")]
+  #[tokio::test]
+  async fn guest_state_sync_preserves_the_pending_playback_intent() {
+    for playing in [true, false] {
+      let (app, rx) = app_with_a_session();
+      let mut network = party_network(&app, sync::PartyRole::Guest).await;
+      let intent = {
+        let mut guard = app.lock().await;
+        guard.dispatch(IoEvent::StartPlayback(
+          Some("qobuz:track:waiting".into()),
+          None,
+          None,
+        ));
+        guard.prepare_playback_event(rx.try_recv().unwrap());
+        guard.playback_intent_generation()
+      };
+      let mut state = host_state();
+      if let sync::SyncMessage::SyncState { is_playing, .. } = &mut state {
+        *is_playing = playing;
+      }
+
+      relay(&mut network, state).await;
+
+      let mut guard = app.lock().await;
+      assert!(matches!(
+        guard.prepare_playback_event(rx.try_recv().unwrap()),
+        IoEvent::StartPlayback(None, Some(uris), None) if uris == [HOST_TRACK]
+      ));
+      if !playing {
+        assert!(matches!(
+          guard.prepare_playback_event(rx.try_recv().unwrap()),
+          IoEvent::PausePlayback
+        ));
+      }
+      assert_eq!(guard.playback_intent_generation(), intent);
+      assert!(rx.try_recv().is_err());
+    }
   }
 
   #[tokio::test]
@@ -2712,8 +2798,8 @@ mod tests {
     relay(&mut network, state).await;
 
     assert!(matches!(
-      rx.try_recv(),
-      Ok(IoEvent::StartPlayback(None, Some(uris), None)) if uris == [HOST_TRACK]
+      app.lock().await.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(None, Some(uris), None) if uris == [HOST_TRACK]
     ));
     assert!(rx.try_recv().is_err());
   }
@@ -2734,8 +2820,8 @@ mod tests {
     network.process_party_messages().await;
 
     assert!(matches!(
-      rx.try_recv(),
-      Ok(IoEvent::StartPlayback(None, Some(uris), None))
+      app.lock().await.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(None, Some(uris), None)
         if uris == ["spotify:track:0000000000000000000002"]
     ));
     assert!(rx.try_recv().is_err());
@@ -2789,8 +2875,11 @@ mod tests {
     relay(&mut network, state).await;
 
     assert!(matches!(
-      rx.try_recv(),
-      Ok(IoEvent::StartPlayback(None, Some(_), None))
+      app
+        .lock()
+        .await
+        .prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(None, Some(_), None)
     ));
     assert!(rx.try_recv().is_err());
   }

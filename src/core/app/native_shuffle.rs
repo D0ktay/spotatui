@@ -237,7 +237,7 @@ impl App {
     };
     if lap_wrapped && self.native_shuffle_repeat_mode() == crate::infra::queue::RepeatMode::Context
     {
-      self.dispatch(IoEvent::ReshuffleNativeShuffleLap);
+      self.dispatch_automatic(IoEvent::ReshuffleNativeShuffleLap);
     }
   }
 }
@@ -376,6 +376,42 @@ mod tests {
     app.sync_native_shuffle_index(base62_id_of(&playing_uri));
 
     assert_eq!(app.native_spotify_shuffle.as_ref().unwrap().index, 1);
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn an_automatic_lap_reshuffle_preserves_the_playback_intent() {
+    let (tx, rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), None);
+    app.current_playback_context = Some(CurrentPlaybackContext {
+      repeat_state: RepeatState::Context,
+      ..crate::core::app::test_support::make_external_context()
+    });
+    app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
+      order: track_uris(&["a", "b"]),
+      original: Vec::new(),
+      index: 1,
+      shuffled: true,
+      fetch_complete: true,
+      fetch_failed: false,
+      generation: 1,
+      pending_reload: None,
+      pending_manual_skip: None,
+    });
+    let generation = app.playback_intent_generation;
+
+    app.sync_native_shuffle_index("a");
+
+    assert_eq!(app.native_spotify_shuffle.as_ref().unwrap().index, 0);
+    assert_eq!(app.playback_intent_generation, generation);
+    let event = rx.try_recv().expect("the lap reshuffle reached the pump");
+    assert!(matches!(event, IoEvent::AutomaticPlayback(_)));
+    assert!(matches!(
+      app.prepare_playback_event(event),
+      IoEvent::ReshuffleNativeShuffleLap
+    ));
+    assert_eq!(app.playback_intent_generation, generation);
+    assert!(rx.try_recv().is_err());
   }
 
   #[cfg(feature = "streaming")]

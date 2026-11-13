@@ -37,6 +37,29 @@ use std::time::Duration;
 /// return `false` (the per-source teardowns/starts still run) but first clear
 /// the queue slot so a new play cleanly takes over.
 pub async fn route_queue_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
+  route_queue_event_inner(app, event, false, false).await
+}
+
+/// Keep the pump's automatic marker if skipping a queue head reaches Qobuz.
+/// A constants replay already holds its place ahead of newer Qobuz events.
+pub(crate) async fn route_queue_pump_event(
+  app: &Arc<Mutex<App>>,
+  event: &IoEvent,
+  replayed: bool,
+  automatic: bool,
+) -> bool {
+  if !replayed && !automatic {
+    return route_queue_event(app, event).await;
+  }
+  route_queue_event_inner(app, event, replayed, automatic).await
+}
+
+async fn route_queue_event_inner(
+  app: &Arc<Mutex<App>>,
+  event: &IoEvent,
+  replayed: bool,
+  automatic: bool,
+) -> bool {
   // Music owns playback: the queue slot was cleared by the claim, and an
   // advance must not start a second player under it.
   if app.lock().await.apple_music_owns_playback() {
@@ -54,7 +77,7 @@ pub async fn route_queue_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
     return false;
   }
   if let IoEvent::AdvanceNativeQueue = event {
-    advance_native_queue(app).await;
+    advance_native_queue(app, replayed, automatic).await;
     return true;
   }
 
@@ -107,12 +130,12 @@ pub async fn route_queue_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
   // bare-resume). Only meaningful when a decoded queued track owns the sink;
   // compiles out entirely without a queueable decoded source.
   #[cfg(feature = "audio-decode-queue")]
-  if let Some(handled) = route_queue_transport(app, event).await {
+  if let Some(handled) = route_queue_transport(app, event, automatic).await {
     return handled;
   }
 
   #[cfg(feature = "streaming")]
-  if let Some(handled) = route_spotify_queue_transport(app, event).await {
+  if let Some(handled) = route_spotify_queue_transport(app, event, automatic).await {
     return handled;
   }
 
@@ -131,7 +154,11 @@ pub async fn route_queue_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
 /// owns the sink. Returns `Some(true)` when consumed, `None` when this event is
 /// not a queue-slot transport control (so the caller falls through).
 #[cfg(feature = "audio-decode-queue")]
-async fn route_queue_transport(app: &Arc<Mutex<App>>, event: &IoEvent) -> Option<bool> {
+async fn route_queue_transport(
+  app: &Arc<Mutex<App>>,
+  event: &IoEvent,
+  automatic: bool,
+) -> Option<bool> {
   let player = {
     let guard = app.lock().await;
     guard.queue_now_decoded_player().map(Arc::clone)
@@ -166,7 +193,7 @@ async fn route_queue_transport(app: &Arc<Mutex<App>>, event: &IoEvent) -> Option
     IoEvent::NextTrack => {
       drop(player);
       app.lock().await.queue_slot_desired_playing = true;
-      advance_native_queue(app).await;
+      advance_native_queue(app, false, automatic).await;
       Some(true)
     }
     // A forward-only queue has no "previous"; restart the current queued track.
@@ -180,7 +207,11 @@ async fn route_queue_transport(app: &Arc<Mutex<App>>, event: &IoEvent) -> Option
 
 /// Transport controls for a queued Spotify track playing through librespot.
 #[cfg(feature = "streaming")]
-async fn route_spotify_queue_transport(app: &Arc<Mutex<App>>, event: &IoEvent) -> Option<bool> {
+async fn route_spotify_queue_transport(
+  app: &Arc<Mutex<App>>,
+  event: &IoEvent,
+  automatic: bool,
+) -> Option<bool> {
   let is_spotify_slot = { app.lock().await.queue_now_is_spotify() };
   if !is_spotify_slot {
     return None;
@@ -215,7 +246,7 @@ async fn route_spotify_queue_transport(app: &Arc<Mutex<App>>, event: &IoEvent) -
     // A skip while paused plays the next item, decoded or not.
     IoEvent::NextTrack => {
       app.lock().await.queue_slot_desired_playing = true;
-      advance_native_queue(app).await;
+      advance_native_queue(app, false, automatic).await;
       Some(true)
     }
     IoEvent::PreviousTrack | IoEvent::ForcePreviousTrack => {
@@ -266,10 +297,41 @@ async fn clear_queue_playback(app: &Arc<Mutex<App>>) {
 /// Pop the head of the native queue and play it, skipping unplayable items with
 /// a status message (bounded by the queue length — never unbounded recursion).
 /// When the queue drains, resume the suspended context (or finish).
-async fn advance_native_queue(app: &Arc<Mutex<App>>) {
+async fn advance_native_queue(app: &Arc<Mutex<App>>, replayed: bool, automatic: bool) {
+  advance_native_queue_inner(app, replayed, automatic, false).await;
+}
+
+/// A failed constants batch makes Qobuz items unplayable for this advance.
+/// Consume them like failed fetches, without scraping again for each item.
+/// The normal next-slot/resume paths retire the producer's advancing latch.
+#[cfg(feature = "qobuz")]
+pub(crate) async fn fail_qobuz_queue_advance(app: &Arc<Mutex<App>>) {
+  advance_native_queue_inner(app, true, true, true).await;
+}
+
+async fn advance_native_queue_inner(
+  app: &Arc<Mutex<App>>,
+  replayed: bool,
+  automatic: bool,
+  qobuz_constants_failed: bool,
+) {
+  #[cfg(not(feature = "qobuz"))]
+  let _ = (replayed, automatic);
   loop {
     let track = {
       let mut guard = app.lock().await;
+      // A skipped head can expose a Qobuz item after the pump's initial gate.
+      #[cfg(feature = "qobuz")]
+      if !replayed
+        && crate::infra::qobuz::dispatch::defer_constants(
+          app,
+          &mut guard,
+          &IoEvent::AdvanceNativeQueue,
+          automatic,
+        )
+      {
+        return;
+      }
       if guard.native_queue.is_empty() {
         None
       } else {
@@ -280,6 +342,14 @@ async fn advance_native_queue(app: &Arc<Mutex<App>>) {
       resume_or_finish(app, QueueEnd::Drained).await;
       return;
     };
+    if qobuz_constants_failed
+      && track
+        .uri
+        .as_deref()
+        .is_some_and(|uri| queue_item_source(uri) == QueueItemSource::Qobuz)
+    {
+      continue;
+    }
     if try_play_queued(app, &track).await {
       return; // now playing this track
     }
@@ -745,7 +815,7 @@ async fn finish_decoded_fetch(
     Ok(fetched) => fetched,
     Err(e) => {
       report_fetch_failure(&mut guard, track_name, &e);
-      guard.dispatch(IoEvent::AdvanceNativeQueue);
+      guard.dispatch_automatic(IoEvent::AdvanceNativeQueue);
       return;
     }
   };
@@ -774,7 +844,7 @@ async fn finish_decoded_fetch(
         4,
       )
     };
-    guard.dispatch(IoEvent::AdvanceNativeQueue);
+    guard.dispatch_automatic(IoEvent::AdvanceNativeQueue);
     return;
   }
   player.set_volume(guard.runtime_state.volume_percent);
@@ -1064,7 +1134,7 @@ async fn resume_or_finish(app: &Arc<Mutex<App>>, end: QueueEnd) {
         let mut guard = app.lock().await;
         // Seed the browse table so the radio start path resolves the station.
         guard.track_table.tracks = vec![*station];
-        guard.dispatch(IoEvent::StartPlayback(Some(uri), None, None));
+        guard.dispatch_automatic(IoEvent::StartPlayback(Some(uri), None, None));
       }
     }
     #[cfg(feature = "streaming")]
@@ -1082,14 +1152,14 @@ async fn resume_or_finish(app: &Arc<Mutex<App>>, end: QueueEnd) {
       }
       let mut guard = app.lock().await;
       guard.release_decoded_sink_claim();
-      guard.dispatch(IoEvent::ResumeNativeShuffleSession(
+      guard.dispatch_automatic(IoEvent::ResumeNativeShuffleSession(
         resume_index,
         generation,
       ));
       // Lands behind the resume on the serial pump, so the reloaded session
       // pauses instead of playing over a device the user just left.
       if !playing {
-        guard.dispatch(IoEvent::PausePlayback);
+        guard.dispatch_automatic(IoEvent::PausePlayback);
       }
     }
     #[cfg(feature = "streaming")]
@@ -1105,9 +1175,9 @@ async fn resume_or_finish(app: &Arc<Mutex<App>>, end: QueueEnd) {
       }
       let mut guard = app.lock().await;
       guard.release_decoded_sink_claim();
-      guard.dispatch(IoEvent::ResumeSpotifyContext(context_uri, resume_track_uri));
+      guard.dispatch_automatic(IoEvent::ResumeSpotifyContext(context_uri, resume_track_uri));
       if !playing {
-        guard.dispatch(IoEvent::PausePlayback);
+        guard.dispatch_automatic(IoEvent::PausePlayback);
       }
     }
     // In slim builds `SuspendedContext` is uninhabited, so every arm above is
@@ -1420,10 +1490,6 @@ mod tests {
   use std::sync::mpsc::channel;
   use std::time::SystemTime;
 
-  #[cfg(any(
-    feature = "streaming",
-    not(all(feature = "qobuz", feature = "subsonic"))
-  ))]
   fn track(uri: &str, name: &str) -> TrackInfo {
     TrackInfo {
       generated_name: None,
@@ -1750,14 +1816,137 @@ mod tests {
 
     assert!(route_queue_event(&app, &IoEvent::AdvanceNativeQueue).await);
 
+    let event = rx.try_recv().unwrap();
+    assert!(matches!(event, IoEvent::AutomaticPlayback(_)));
     assert!(
       matches!(
-        rx.try_recv(),
-        Ok(IoEvent::ResumeNativeShuffleSession(Some(2), 7))
+        app.lock().await.prepare_playback_event(event),
+        IoEvent::ResumeNativeShuffleSession(Some(2), 7)
       ),
       "the drain must forward the resume index and its session generation"
     );
     assert!(app.lock().await.queue_suspended.is_none());
+  }
+
+  #[cfg(all(feature = "streaming", feature = "qobuz"))]
+  #[tokio::test]
+  async fn resuming_a_shuffled_context_preserves_the_pending_playback_intent() {
+    use crate::core::queue::SuspendedContext;
+    for playing in [true, false] {
+      let (app, rx) = test_app_with_rx();
+      let mut guard = app.lock().await;
+      guard.dispatch(IoEvent::StartPlayback(
+        Some("qobuz:track:waiting".into()),
+        None,
+        None,
+      ));
+      assert!(matches!(rx.try_recv(), Ok(IoEvent::StartPlayback(..))));
+      guard.queue_slot_desired_playing = playing;
+      guard.queue_suspended = Some(SuspendedContext::SpotifyShuffled {
+        resume_index: Some(2),
+        generation: 7,
+        context_uri: None,
+        resume_track_uri: None,
+      });
+      let generation = guard.playback_intent_generation();
+      drop(guard);
+
+      assert!(route_queue_pump_event(&app, &IoEvent::AdvanceNativeQueue, false, true).await);
+
+      let mut guard = app.lock().await;
+      assert_eq!(guard.playback_intent_generation(), generation);
+      assert!(matches!(
+        guard.prepare_playback_event(rx.try_recv().unwrap()),
+        IoEvent::ResumeNativeShuffleSession(Some(2), 7)
+      ));
+      if !playing {
+        assert!(matches!(
+          guard.prepare_playback_event(rx.try_recv().unwrap()),
+          IoEvent::PausePlayback
+        ));
+      }
+      assert_eq!(guard.playback_intent_generation(), generation);
+      assert!(rx.try_recv().is_err());
+    }
+  }
+
+  #[cfg(all(feature = "streaming", feature = "qobuz"))]
+  #[tokio::test]
+  async fn resuming_a_spotify_context_preserves_the_pending_playback_intent() {
+    use crate::core::queue::SuspendedContext;
+    for playing in [true, false] {
+      let (app, rx) = test_app_with_rx();
+      let mut guard = app.lock().await;
+      guard.dispatch(IoEvent::StartPlayback(
+        Some("qobuz:track:waiting".into()),
+        None,
+        None,
+      ));
+      guard.prepare_playback_event(rx.try_recv().unwrap());
+      guard.queue_slot_desired_playing = playing;
+      guard.queue_suspended = Some(SuspendedContext::Spotify {
+        context_uri: Some("spotify:playlist:context".into()),
+        resume_track_uri: Some("spotify:track:resume".into()),
+      });
+      let generation = guard.playback_intent_generation();
+      drop(guard);
+
+      assert!(route_queue_pump_event(&app, &IoEvent::AdvanceNativeQueue, false, true).await);
+
+      let mut guard = app.lock().await;
+      assert_eq!(guard.playback_intent_generation(), generation);
+      assert!(matches!(
+        guard.prepare_playback_event(rx.try_recv().unwrap()),
+        IoEvent::ResumeSpotifyContext(Some(context), Some(track))
+          if context == "spotify:playlist:context" && track == "spotify:track:resume"
+      ));
+      if !playing {
+        assert!(matches!(
+          guard.prepare_playback_event(rx.try_recv().unwrap()),
+          IoEvent::PausePlayback
+        ));
+      }
+      assert_eq!(guard.playback_intent_generation(), generation);
+      assert!(rx.try_recv().is_err());
+    }
+  }
+
+  #[cfg(feature = "qobuz")]
+  #[tokio::test]
+  async fn failed_downloads_and_decodes_preserve_the_pending_playback_intent() {
+    for decode_failure in [false, true] {
+      let (tx, rx) = channel();
+      let app = Arc::new(Mutex::new(App::new(tx, UserConfig::new(), None)));
+      let mut guard = app.lock().await;
+      guard.dispatch(IoEvent::StartPlayback(
+        Some("qobuz:track:waiting".into()),
+        None,
+        None,
+      ));
+      guard.prepare_playback_event(rx.try_recv().unwrap());
+      let generation = guard.playback_intent_generation();
+      drop(guard);
+      let player = Arc::new(LocalPlayer::without_device());
+      let fetch_id =
+        publish_pending_decoded(&app, &player, &track("qobuz:track:1", "Failed")).await;
+      let fetched = if decode_failure {
+        Ok((tempfile::NamedTempFile::new().unwrap(), None))
+      } else {
+        Err(anyhow::anyhow!("download failed"))
+      };
+
+      finish_decoded_fetch(&app, fetch_id, fetched, "Failed").await;
+
+      let mut guard = app.lock().await;
+      assert_eq!(guard.playback_intent_generation(), generation);
+      assert!(matches!(
+        guard.prepare_playback_event(rx.try_recv().unwrap()),
+        IoEvent::AdvanceNativeQueue
+      ));
+      assert_eq!(guard.playback_intent_generation(), generation);
+      assert!(guard.status_message().unwrap().contains("Failed"));
+      assert!(rx.try_recv().is_err());
+    }
   }
 
   #[tokio::test]
@@ -1799,8 +1988,11 @@ mod tests {
     app.lock().await.queue_suspended = Some(suspended.clone());
     assert!(route_queue_event(&app, &IoEvent::AdvanceNativeQueue).await);
     assert!(matches!(
-      rx.try_recv(),
-      Ok(IoEvent::ResumeSpotifyContext(..))
+      app
+        .lock()
+        .await
+        .prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::ResumeSpotifyContext(..)
     ));
 
     app.lock().await.queue_suspended = Some(suspended);
@@ -1845,8 +2037,11 @@ mod tests {
 
     assert!(!app.lock().await.decoded_sink_claimed());
     assert!(matches!(
-      rx.try_recv(),
-      Ok(IoEvent::ResumeSpotifyContext(..))
+      app
+        .lock()
+        .await
+        .prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::ResumeSpotifyContext(..)
     ));
   }
 
@@ -1883,10 +2078,12 @@ mod tests {
 
     assert!(route_queue_event(&app, &IoEvent::AdvanceNativeQueue).await);
 
+    let event = rx.try_recv().unwrap();
+    assert!(matches!(event, IoEvent::AutomaticPlayback(_)));
     assert!(
       matches!(
-        rx.try_recv(),
-        Ok(IoEvent::ResumeNativeShuffleSession(None, 4))
+        app.lock().await.prepare_playback_event(event),
+        IoEvent::ResumeNativeShuffleSession(None, 4)
       ),
       "an exhausted session still forwards its generation"
     );

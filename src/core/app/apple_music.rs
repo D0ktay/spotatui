@@ -69,6 +69,7 @@ impl App {
   /// media key's play or pause, a plugin's `Play`): unlike a toggle, the
   /// answer must not depend on a snapshot that may not have arrived yet.
   pub(crate) fn set_apple_music_playing(&mut self, playing: bool) {
+    self.bump_playback_intent();
     if self.apple_music.switching {
       self.set_status_message(self.strings().status.app.music_wait_pause, 4);
       return;
@@ -525,7 +526,7 @@ impl App {
       self.apple_music.observed_at = Some(Instant::now());
       self.apple_music.read_at = Some(std::time::SystemTime::now());
       self.sync_apple_music_list();
-      if ended && self.step_apple_music(true) {
+      if ended && self.step_apple_music_with_origin(true, true) {
         self.apple_music.desired_playing = true;
       }
       self.note_display_changes();
@@ -862,6 +863,10 @@ impl App {
   }
 
   pub(crate) fn step_apple_music(&mut self, forward: bool) -> bool {
+    self.step_apple_music_with_origin(forward, false)
+  }
+
+  fn step_apple_music_with_origin(&mut self, forward: bool, automatic: bool) -> bool {
     // Handing off: a start now would cancel the switch to the other source.
     // Music's own command, the fallback, is refused with a message instead.
     if self.apple_music.switching {
@@ -912,7 +917,15 @@ impl App {
     list.stepped_at = Instant::now();
     let (context, uri) = (list.context.clone(), list.uris[next].clone());
     self.note_apple_music_start();
-    self.start_playback_track_in_context(context, uri);
+    if automatic {
+      self.dispatch_automatic(IoEvent::StartPlayback(
+        Some(context),
+        Some(vec![uri]),
+        Some(0),
+      ));
+    } else {
+      self.start_playback_track_in_context(context, uri);
+    }
     true
   }
 
@@ -1287,11 +1300,13 @@ mod tests {
 
     // Reached the end: Music stops with no current track, the next one starts.
     let (mut app, rx, generation) = setup(98.0);
+    let intent = app.playback_intent_generation;
     app.accept_apple_music_snapshot(generation, at(false, 0.0, false));
     assert!(matches!(
-      rx.try_recv(),
-      Ok(IoEvent::StartPlayback(Some(_), Some(ref next), Some(0))) if next[..] == uris[1..]
+      app.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(Some(_), Some(ref next), Some(0)) if next[..] == uris[1..]
     ));
+    assert_eq!(app.playback_intent_generation, intent);
     assert!(app.apple_music_is_playing());
 
     // Stopped in the middle of the track: the user's doing, nothing starts.
@@ -1312,8 +1327,8 @@ mod tests {
     app.finish_apple_music_command();
     app.accept_apple_music_snapshot(generation, at(false, 0.0, false));
     assert!(matches!(
-      rx.try_recv(),
-      Ok(IoEvent::StartPlayback(Some(_), Some(ref next), Some(0))) if next[..] == uris[1..]
+      app.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(Some(_), Some(ref next), Some(0)) if next[..] == uris[1..]
     ));
 
     // Right after spotatui started a track, the old track's end is not the
@@ -1339,7 +1354,10 @@ mod tests {
       list.stepped_at = Instant::now() - std::time::Duration::from_secs(10);
     }
     app.accept_apple_music_snapshot(generation, at(false, 0.0, false));
-    assert!(matches!(rx.try_recv(), Ok(IoEvent::StartPlayback(..))));
+    assert!(matches!(
+      app.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(..)
+    ));
 
     // Reads stopped for 20s from 94s into the track (Music busy, the Mac
     // asleep): the track ran out meanwhile, and that still counts.
@@ -1348,20 +1366,29 @@ mod tests {
     app.apple_music.read_at =
       Some(std::time::SystemTime::now() - std::time::Duration::from_secs(20));
     app.accept_apple_music_snapshot(generation, at(false, 0.0, false));
-    assert!(matches!(rx.try_recv(), Ok(IoEvent::StartPlayback(..))));
+    assert!(matches!(
+      app.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(..)
+    ));
     // The Mac asleep: the monotonic clock did not move, the wall clock did.
     let (mut app, rx, generation) = setup(94.0);
     app.apple_music.read_at =
       Some(std::time::SystemTime::now() - std::time::Duration::from_secs(20));
     app.accept_apple_music_snapshot(generation, at(false, 0.0, false));
-    assert!(matches!(rx.try_recv(), Ok(IoEvent::StartPlayback(..))));
+    assert!(matches!(
+      app.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(..)
+    ));
 
     // A command that failed in the last seconds keeps the track too.
     let (mut app, rx, generation) = setup(98.0);
     app.finish_apple_music_command();
     app.apple_music_failed(generation, anyhow!("Music helper failed"));
     app.accept_apple_music_snapshot(generation, at(false, 0.0, false));
-    assert!(matches!(rx.try_recv(), Ok(IoEvent::StartPlayback(..))));
+    assert!(matches!(
+      app.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(..)
+    ));
 
     // Music quitting near the end of a track, with a command in flight, is
     // not an end: nothing starts, and nothing of that read is shown.

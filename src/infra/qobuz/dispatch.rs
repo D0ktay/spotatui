@@ -22,11 +22,14 @@
 //! tears the session down instead of skipping (a skip would walk the queue at
 //! tick speed); a failure after that ends the track early.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use futures::future::{BoxFuture, Shared};
+use futures::FutureExt;
 use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 
@@ -151,10 +154,232 @@ async fn cached_bundle(app: &Arc<Mutex<App>>) -> Option<QobuzBundleCache> {
   crate::core::state::load(&path).ok()?.qobuz_bundle_cache
 }
 
-/// The bundle constants; a fresh scrape is saved into `state.yml`. The first
-/// call of a process runs the login-page GET (and, on a new bundle version, the
-/// 9 MB bundle GET) inline on the serial pump; accepted for v1.
+type ConstantsResolution = Shared<BoxFuture<'static, Result<QobuzBundleCache, String>>>;
+
+/// Share failures as well as successes, and keep resolving if a waiter is cancelled.
+#[derive(Default)]
+struct ConstantsResolver {
+  state: std::sync::Mutex<ConstantsState>,
+  ready: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct ConstantsState {
+  resolved: Option<QobuzBundleCache>,
+  in_flight: Option<ConstantsResolution>,
+  completed: Option<Result<QobuzBundleCache, String>>,
+  pending: VecDeque<PendingConstantsEvent>,
+}
+
+struct PendingConstantsEvent {
+  app: Arc<Mutex<App>>,
+  event: IoEvent,
+  epoch: u64,
+  playback_intent: Option<u64>,
+  superseded_by_start: bool,
+  queue_advance_fetch_id: Option<u64>,
+  queue_suspension_generation: u64,
+}
+
+impl ConstantsResolver {
+  fn resolve_with<F, Fut>(self: &Arc<Self>, resolve: F) -> ConstantsResolution
+  where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<QobuzBundleCache>> + Send,
+  {
+    if let Ok(mut state) = self.state.lock() {
+      self.start(&mut state, resolve)
+    } else {
+      futures::future::ready(Err("Qobuz constants resolver lock poisoned".into()))
+        .boxed()
+        .shared()
+    }
+  }
+
+  fn defer_with<F, Fut>(
+    self: &Arc<Self>,
+    app: &Arc<Mutex<App>>,
+    locked_app: &mut App,
+    event: IoEvent,
+    epoch: u64,
+    resolve: F,
+  ) -> bool
+  where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<QobuzBundleCache>> + Send,
+  {
+    let Ok(mut state) = self.state.lock() else {
+      report_locked(
+        locked_app,
+        QobuzStep::Constants,
+        anyhow!("Qobuz constants resolver lock poisoned"),
+      );
+      return true;
+    };
+    if state.resolved.is_some() && state.pending.is_empty() {
+      return false;
+    }
+    if state.pending.is_empty()
+      && state
+        .in_flight
+        .as_ref()
+        .is_none_or(|resolution| resolution.peek().is_none())
+      && auth::token_epoch() == epoch
+    {
+      let message = locked_app.strings().status.infra.qobuz_preparing;
+      locked_app.set_status_message(message, 30);
+    }
+    let playback_event = match &event {
+      IoEvent::AutomaticPlayback(event) => event.as_ref(),
+      event => event,
+    };
+    let playback_intent = matches!(
+      playback_event,
+      IoEvent::StartPlayback(..) | IoEvent::AdvanceNativeQueue
+    )
+    .then(|| locked_app.playback_intent_generation());
+    let queue_advance_fetch_id = matches!(playback_event, IoEvent::AdvanceNativeQueue)
+      .then(|| locked_app.queue_advance_fetch_id())
+      .flatten();
+    // Keep suppressed work until the result is known: a failed start still
+    // needs the automatic queue advance's failure cleanup.
+    let superseded_by_start = matches!(event, IoEvent::AutomaticPlayback(_))
+      && playback_intent.is_some()
+      && state.pending.iter().any(|pending| {
+        Arc::ptr_eq(&pending.app, app)
+          && pending.epoch == epoch
+          && pending.playback_intent == playback_intent
+          && matches!(pending.event, IoEvent::StartPlayback(..))
+      });
+    state.pending.push_back(PendingConstantsEvent {
+      app: Arc::clone(app),
+      event,
+      epoch,
+      playback_intent,
+      superseded_by_start,
+      queue_advance_fetch_id,
+      queue_suspension_generation: locked_app.queue_suspension_generation(),
+    });
+    let _resolution = self.start(&mut state, resolve);
+    true
+  }
+
+  /// Only the serial pump drains this queue. New pump events keep deferring
+  /// while it is nonempty; replay never goes to the back of the IO channel.
+  async fn next_pending(&self) -> Option<PendingConstantsEvent> {
+    loop {
+      let (mut pending, result, later_queue_advance) = {
+        let Ok(mut state) = self.state.lock() else {
+          return None;
+        };
+        let result = state.completed.clone()?;
+        let pending = state.pending.pop_front()?;
+        let later_queue_advance = state.pending.iter().any(|later| {
+          Arc::ptr_eq(&later.app, &pending.app)
+            && match &later.event {
+              IoEvent::AutomaticPlayback(event) => matches!(**event, IoEvent::AdvanceNativeQueue),
+              event => matches!(event, IoEvent::AdvanceNativeQueue),
+            }
+        });
+        if state.pending.is_empty() {
+          state.in_flight = None;
+          state.completed = None;
+        }
+        (pending, result, later_queue_advance)
+      };
+      let mut app = pending.app.lock().await;
+      if app.status_message() == Some(app.strings().status.infra.qobuz_preparing) {
+        app.clear_status_message();
+      }
+      pending.event = match pending.event {
+        IoEvent::AutomaticPlayback(event) => *event,
+        event => event,
+      };
+      if auth::token_epoch() != pending.epoch
+        || pending
+          .playback_intent
+          .is_some_and(|generation| generation != app.playback_intent_generation())
+      {
+        if matches!(pending.event, IoEvent::AdvanceNativeQueue) && !later_queue_advance {
+          app.release_queue_advance(
+            pending.queue_advance_fetch_id,
+            pending.queue_suspension_generation,
+          );
+        }
+        continue;
+      }
+      match result {
+        Ok(_) if pending.superseded_by_start => {
+          // The preceding explicit start runs through the queue router, which
+          // clears the old slot before handing playback to the chosen source.
+        }
+        Ok(_) => {
+          drop(app);
+          return Some(pending);
+        }
+        Err(err) => {
+          if matches!(pending.event, IoEvent::AdvanceNativeQueue) {
+            drop(app);
+            crate::infra::queue::dispatch::fail_qobuz_queue_advance(&pending.app).await;
+            app = pending.app.lock().await;
+          }
+          report_locked(&mut app, QobuzStep::Constants, anyhow!(err));
+        }
+      }
+    }
+  }
+
+  fn start<F, Fut>(self: &Arc<Self>, state: &mut ConstantsState, resolve: F) -> ConstantsResolution
+  where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<QobuzBundleCache>> + Send,
+  {
+    if let Some(constants) = state.resolved.clone() {
+      return futures::future::ready(Ok(constants)).boxed().shared();
+    }
+    if let Some(resolution) = state.in_flight.as_ref() {
+      return resolution.clone();
+    }
+    let resolution = async move { resolve().await.map_err(|err| format!("{err:#}")) }
+      .boxed()
+      .shared();
+    state.in_flight = Some(resolution.clone());
+    let resolver = Arc::clone(self);
+    let task = resolution.clone();
+    tokio::spawn(async move {
+      let result = task.await;
+      if let Ok(mut state) = resolver.state.lock() {
+        state.resolved = result.as_ref().ok().cloned();
+        if state.pending.is_empty() {
+          state.in_flight = None;
+        } else {
+          state.completed = Some(result);
+        }
+      }
+      resolver.ready.notify_one();
+    });
+    resolution
+  }
+}
+
+fn constants_resolver() -> &'static Arc<ConstantsResolver> {
+  static RESOLVER: OnceLock<Arc<ConstantsResolver>> = OnceLock::new();
+  RESOLVER.get_or_init(|| Arc::new(ConstantsResolver::default()))
+}
+
+/// Pump callers defer their event; off-pump callers (playlist sync, startup)
+/// can await the same resolve directly.
 async fn constants(app: &Arc<Mutex<App>>) -> Result<QobuzBundleCache> {
+  let app = Arc::clone(app);
+  constants_resolver()
+    .resolve_with(move || async move { resolve_constants(&app).await })
+    .await
+    .map_err(|err| anyhow!(err))
+}
+
+/// The scrape and cache read run only on the detached resolver task.
+async fn resolve_constants(app: &Arc<Mutex<App>>) -> Result<QobuzBundleCache> {
+  let epoch = auth::token_epoch();
   let http = super::shared_qobuz_client();
   if auth::constants_resolved() {
     return auth::resolve_constants(&http, None).await;
@@ -162,12 +387,69 @@ async fn constants(app: &Arc<Mutex<App>>) -> Result<QobuzBundleCache> {
   let cached = cached_bundle(app).await;
   let resolved = auth::resolve_constants(&http, cached.as_ref()).await?;
   if cached.as_ref() != Some(&resolved) && resolved.bundle_version != "env" {
-    app
-      .lock()
-      .await
-      .schedule_state_save(PersistedRuntimeState::qobuz_bundle_cache(resolved.clone()));
+    let mut app = app.lock().await;
+    if auth::token_epoch() == epoch {
+      app.schedule_state_save(PersistedRuntimeState::qobuz_bundle_cache(resolved.clone()));
+    }
   }
   Ok(resolved)
+}
+
+/// Hold the exact user action without awaiting the scrape on the serial pump.
+pub(crate) fn defer_constants(
+  app: &Arc<Mutex<App>>,
+  locked_app: &mut App,
+  event: &IoEvent,
+  automatic: bool,
+) -> bool {
+  let retry = match event {
+    IoEvent::GetQobuzPlaylists => IoEvent::GetQobuzPlaylists,
+    IoEvent::GetQobuzTracks(uri) => IoEvent::GetQobuzTracks(uri.clone()),
+    IoEvent::GetQobuzSearchResults(query) => IoEvent::GetQobuzSearchResults(query.clone()),
+    IoEvent::QobuzLogin => IoEvent::QobuzLogin,
+    IoEvent::StartPlayback(context, uris, offset)
+      if context.as_deref().is_some_and(is_qobuz_uri)
+        || (context.is_none()
+          && uris
+            .as_ref()
+            .and_then(|uris| uris.first())
+            .is_some_and(|uri| is_qobuz_uri(uri))) =>
+    {
+      IoEvent::StartPlayback(context.clone(), uris.clone(), *offset)
+    }
+    IoEvent::AdvanceNativeQueue
+      if !locked_app.apple_music_owns_playback()
+        && locked_app
+          .native_queue
+          .first()
+          .and_then(|track| track.uri.as_deref())
+          .is_some_and(is_qobuz_uri) =>
+    {
+      IoEvent::AdvanceNativeQueue
+    }
+    _ => return false,
+  };
+  let retry = if automatic {
+    IoEvent::AutomaticPlayback(Box::new(retry))
+  } else {
+    retry
+  };
+  let epoch = auth::token_epoch();
+  let app_for_resolve = Arc::clone(app);
+  constants_resolver().defer_with(app, locked_app, retry, epoch, move || async move {
+    resolve_constants(&app_for_resolve).await
+  })
+}
+
+pub(crate) fn constants_ready() -> &'static tokio::sync::Notify {
+  &constants_resolver().ready
+}
+
+pub(crate) async fn next_pending_constants_event() -> Option<IoEvent> {
+  constants_resolver()
+    .next_pending()
+    .await
+    .map(|pending| pending.event)
 }
 
 /// What to do when no token is available.
@@ -741,7 +1023,7 @@ async fn commit_fetch(
       position_ms: resume.map_or(0, |r| r.position_ms),
       paused,
     });
-    guard.dispatch(IoEvent::ReplayCurrentTrack);
+    guard.dispatch_automatic(IoEvent::ReplayCurrentTrack);
     return;
   }
   s.advancing = false;
@@ -981,6 +1263,1017 @@ async fn teardown_qobuz(app: &Arc<Mutex<App>>) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn app_with_events() -> (Arc<Mutex<App>>, std::sync::mpsc::Receiver<IoEvent>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let app = App::new(tx, crate::core::user_config::UserConfig::new(), None);
+    (Arc::new(Mutex::new(app)), rx)
+  }
+
+  fn bundle_constants() -> QobuzBundleCache {
+    QobuzBundleCache {
+      bundle_version: "fixture".into(),
+      app_id: "fixture-id".into(),
+      app_secret: "fixture-secret".into(),
+      oauth_key: "fixture-key".into(),
+    }
+  }
+
+  fn ended_queue(app: &mut App) {
+    use crate::core::test_helpers::queued_track;
+    use crate::infra::queue::{DecodedQueuePlayback, QueueNowPlaying};
+
+    app.queue_now = Some(QueueNowPlaying::Decoded(DecodedQueuePlayback {
+      player: Arc::new(LocalPlayer::without_device()),
+      track: queued_track("qobuz:track:ended", "Ended"),
+      advancing: true,
+      fetch_id: 1,
+      tempfile: None,
+      abort_handle: None,
+      quality: None,
+    }));
+    app.native_queue = vec![
+      queued_track("qobuz:track:1", "First"),
+      queued_track("qobuz:track:2", "Second"),
+    ];
+  }
+
+  async fn resolution_finishes(resolver: &ConstantsResolver) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+      loop {
+        if let Some(pending) = resolver.next_pending().await {
+          pending
+            .app
+            .lock()
+            .await
+            .dispatch_without_spinner(pending.event);
+        }
+        if resolver
+          .state
+          .lock()
+          .expect("resolver state")
+          .in_flight
+          .is_none()
+        {
+          return;
+        }
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("detached constants resolution did not finish");
+  }
+
+  #[tokio::test]
+  async fn later_playback_requests_drop_parked_qobuz_starts_but_keep_browsing() {
+    for advance in [false, true] {
+      for event in [
+        IoEvent::StartPlayback(Some("file:///later.mp3".into()), None, None),
+        IoEvent::StartPlayback(None, Some(vec!["spotify:track:later".into()]), Some(0)),
+        IoEvent::StartPlayback(Some("radio:https://example.com/live".into()), None, None),
+        IoEvent::StartPlayback(Some("qobuz:track:later".into()), None, None),
+        IoEvent::StartPlayback(Some("subsonic:track:later".into()), None, None),
+        IoEvent::StartPlayback(Some("youtube:track:later".into()), None, None),
+        IoEvent::StartPlayback(Some("applemusic:track:later".into()), None, None),
+        IoEvent::PausePlayback,
+        IoEvent::NextTrack,
+        IoEvent::PreviousTrack,
+        IoEvent::ForcePreviousTrack,
+        IoEvent::AdvanceNativeQueue,
+        IoEvent::FinishNativeQueue,
+        IoEvent::ReplayCurrentTrack,
+        IoEvent::ResumeSpotifyContext(None, None),
+        IoEvent::ResumeNativeShuffleSession(Some(0), 0),
+        IoEvent::ReshuffleNativeShuffleLap,
+      ] {
+        let resolver = Arc::new(ConstantsResolver::default());
+        let (app, rx) = app_with_events();
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        let epoch = auth::token_epoch();
+        {
+          let mut guard = app.lock().await;
+          let start = if advance {
+            IoEvent::AdvanceNativeQueue
+          } else {
+            IoEvent::StartPlayback(Some("qobuz:track:older".into()), None, None)
+          };
+          guard.note_playback_intent(&start);
+          assert!(
+            resolver.defer_with(&app, &mut guard, start, epoch, || async {
+              wait.await.unwrap()
+            })
+          );
+          assert!(resolver.defer_with(
+            &app,
+            &mut guard,
+            IoEvent::GetQobuzPlaylists,
+            epoch,
+            || async { panic!("browsing shares the parked start's resolve") }
+          ));
+          for event in [
+            IoEvent::GetQobuzTracks("qobuz:album:1".into()),
+            IoEvent::GetQobuzSearchResults("query".into()),
+            IoEvent::QobuzLogin,
+          ] {
+            assert!(
+              resolver.defer_with(&app, &mut guard, event, epoch, || async {
+                panic!("shared scrape")
+              })
+            );
+          }
+          guard.dispatch(event);
+        }
+        assert!(rx.try_recv().is_ok(), "the later request reached the pump");
+        finish.send(Ok(bundle_constants())).unwrap();
+        resolution_finishes(&resolver).await;
+        assert!(matches!(rx.try_recv(), Ok(IoEvent::GetQobuzPlaylists)));
+        assert!(matches!(rx.try_recv(), Ok(IoEvent::GetQobuzTracks(_))));
+        assert!(matches!(
+          rx.try_recv(),
+          Ok(IoEvent::GetQobuzSearchResults(_))
+        ));
+        assert!(matches!(rx.try_recv(), Ok(IoEvent::QobuzLogin)));
+        assert!(
+          rx.try_recv().is_err(),
+          "a superseded start must never replay"
+        );
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn automatic_advances_keep_a_parked_qobuz_start_until_the_user_skips() {
+    for user_skip in [false, true] {
+      for event in [
+        IoEvent::NextTrack,
+        IoEvent::PreviousTrack,
+        IoEvent::ForcePreviousTrack,
+        IoEvent::AdvanceNativeQueue,
+        IoEvent::ReplayCurrentTrack,
+        IoEvent::FinishNativeQueue,
+        IoEvent::StartPlayback(Some("radio:https://example.com/live".into()), None, None),
+        IoEvent::PausePlayback,
+        IoEvent::ResumeSpotifyContext(None, None),
+        IoEvent::ReshuffleNativeShuffleLap,
+        IoEvent::ResumeNativeShuffleSession(Some(0), 0),
+      ] {
+        let resolver = Arc::new(ConstantsResolver::default());
+        let (app, rx) = app_with_events();
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        let mut guard = app.lock().await;
+        let start = IoEvent::StartPlayback(Some("qobuz:track:waiting".into()), None, None);
+        guard.dispatch(start);
+        let start = guard.prepare_playback_event(rx.try_recv().unwrap());
+        assert!(
+          resolver.defer_with(&app, &mut guard, start, auth::token_epoch(), || async {
+            wait.await.unwrap()
+          })
+        );
+        let generation = guard.playback_intent_generation();
+        guard.dispatch_automatic(event);
+        let automatic = guard.prepare_playback_event(rx.try_recv().unwrap());
+        assert!(matches!(
+          automatic,
+          IoEvent::NextTrack
+            | IoEvent::PreviousTrack
+            | IoEvent::ForcePreviousTrack
+            | IoEvent::AdvanceNativeQueue
+            | IoEvent::ReplayCurrentTrack
+            | IoEvent::FinishNativeQueue
+            | IoEvent::StartPlayback(..)
+            | IoEvent::PausePlayback
+            | IoEvent::ResumeSpotifyContext(..)
+            | IoEvent::ReshuffleNativeShuffleLap
+            | IoEvent::ResumeNativeShuffleSession(..)
+        ));
+        assert_eq!(guard.playback_intent_generation(), generation);
+        if user_skip {
+          guard.dispatch(IoEvent::NextTrack);
+          assert!(matches!(
+            guard.prepare_playback_event(rx.try_recv().unwrap()),
+            IoEvent::NextTrack
+          ));
+          assert_ne!(guard.playback_intent_generation(), generation);
+        }
+        drop(guard);
+        finish.send(Ok(bundle_constants())).unwrap();
+        resolution_finishes(&resolver).await;
+        if !user_skip {
+          assert!(
+            matches!(rx.try_recv(), Ok(IoEvent::StartPlayback(Some(uri), None, None)) if uri == "qobuz:track:waiting")
+          );
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.lock().await.status_message(), None);
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn automatic_queue_advances_do_not_replace_an_earlier_parked_start() {
+    for start in [
+      IoEvent::StartPlayback(Some("qobuz:track:chosen".into()), None, None),
+      IoEvent::StartPlayback(None, Some(vec!["qobuz:track:chosen".into()]), Some(0)),
+    ] {
+      let resolver = Arc::new(ConstantsResolver::default());
+      let (app, rx) = app_with_events();
+      let (finish, wait) = tokio::sync::oneshot::channel();
+      let epoch = auth::token_epoch();
+      let mut guard = app.lock().await;
+      ended_queue(&mut guard);
+      guard.dispatch(start);
+      let start = guard.prepare_playback_event(rx.try_recv().unwrap());
+      assert!(
+        resolver.defer_with(&app, &mut guard, start, epoch, || async {
+          wait.await.unwrap()
+        })
+      );
+      let generation = guard.playback_intent_generation();
+      guard.dispatch_automatic(IoEvent::AdvanceNativeQueue);
+      let automatic = rx.try_recv().unwrap();
+      assert!(matches!(automatic, IoEvent::AutomaticPlayback(_)));
+      assert!(
+        resolver.defer_with(&app, &mut guard, automatic, epoch, || async {
+          panic!("the automatic advance shares the pending resolution")
+        })
+      );
+      assert_eq!(guard.playback_intent_generation(), generation);
+      assert_eq!(resolver.state.lock().unwrap().pending.len(), 2);
+      drop(guard);
+
+      finish.send(Ok(bundle_constants())).unwrap();
+      resolver.ready.notified().await;
+
+      let pending = resolver.next_pending().await.unwrap();
+      assert!(matches!(pending.event, IoEvent::StartPlayback(..)));
+      assert!(
+        !crate::infra::queue::dispatch::route_queue_event(&app, &pending.event).await,
+        "only the explicit start reaches the source router"
+      );
+      assert!(
+        app.lock().await.queue_now.is_none(),
+        "the old latch is gone"
+      );
+      assert!(resolver.next_pending().await.is_none());
+      assert!(
+        rx.try_recv().is_err(),
+        "the automatic advance must not replay"
+      );
+      let guard = app.lock().await;
+      assert_eq!(guard.native_queue.len(), 2, "no queued track was played");
+      assert_eq!(guard.playback_intent_generation(), generation);
+    }
+  }
+
+  #[tokio::test]
+  async fn an_automatic_queue_advance_parked_alone_still_replays() {
+    let resolver = Arc::new(ConstantsResolver::default());
+    let (app, rx) = app_with_events();
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    let mut guard = app.lock().await;
+    guard.dispatch_automatic(IoEvent::AdvanceNativeQueue);
+    let automatic = rx.try_recv().unwrap();
+    assert!(matches!(automatic, IoEvent::AutomaticPlayback(_)));
+    let generation = guard.playback_intent_generation();
+    assert!(
+      resolver.defer_with(&app, &mut guard, automatic, auth::token_epoch(), || async {
+        wait.await.unwrap()
+      })
+    );
+    assert!(rx.try_recv().is_err(), "the advance waits for constants");
+    drop(guard);
+
+    finish.send(Ok(bundle_constants())).unwrap();
+    resolution_finishes(&resolver).await;
+
+    assert!(matches!(rx.try_recv(), Ok(IoEvent::AdvanceNativeQueue)));
+    assert!(rx.try_recv().is_err());
+    assert_eq!(app.lock().await.playback_intent_generation(), generation);
+  }
+
+  #[tokio::test]
+  async fn a_failed_scrape_drains_qobuz_queue_items_and_releases_the_advance_latch() {
+    failed_scrape_releases_queue_advance(false).await;
+  }
+
+  #[tokio::test]
+  async fn a_failed_start_keeps_the_suppressed_queue_advance_cleanup() {
+    failed_scrape_releases_queue_advance(true).await;
+  }
+
+  async fn failed_scrape_releases_queue_advance(pending_start: bool) {
+    use crate::core::driver::{Driver, TickEnv};
+
+    let resolver = Arc::new(ConstantsResolver::default());
+    let (app, rx) = app_with_events();
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    let attempts = Arc::new(AtomicU64::new(0));
+    let resolved_attempts = Arc::clone(&attempts);
+    let resolution = resolver.resolve_with(|| async move {
+      resolved_attempts.fetch_add(1, Ordering::SeqCst);
+      wait.await.unwrap()
+    });
+    let mut guard = app.lock().await;
+    ended_queue(&mut guard);
+    if pending_start {
+      let start = IoEvent::StartPlayback(Some("qobuz:track:chosen".into()), None, None);
+      guard.note_playback_intent(&start);
+      assert!(
+        resolver.defer_with(&app, &mut guard, start, auth::token_epoch(), || async {
+          panic!("the start shares the pending resolution")
+        })
+      );
+    }
+    let generation = guard.playback_intent_generation();
+    assert!(resolver.defer_with(
+      &app,
+      &mut guard,
+      IoEvent::AutomaticPlayback(Box::new(IoEvent::AdvanceNativeQueue)),
+      auth::token_epoch(),
+      || async { panic!("the advance shares the pending resolution") }
+    ));
+    drop(guard);
+    finish
+      .send(Err(anyhow!("injected scrape failure")))
+      .unwrap();
+    assert!(resolution.await.is_err());
+    resolution_finishes(&resolver).await;
+
+    let mut guard = app.lock().await;
+    assert!(
+      guard.queue_now.is_none(),
+      "the completed slot and its latch must go"
+    );
+    assert!(
+      guard.native_queue.is_empty(),
+      "failed items must be consumed once"
+    );
+    assert_eq!(guard.playback_intent_generation(), generation);
+    assert!(guard
+      .status_message()
+      .unwrap()
+      .contains("injected scrape failure"));
+    assert!(guard.api_error().is_empty());
+    let mut driver = Driver::new(None, None);
+    for _ in 0..3 {
+      driver.tick(
+        &mut guard,
+        Duration::ZERO,
+        TickEnv {
+          now: std::time::Instant::now(),
+          #[cfg(any(feature = "audio-viz", feature = "audio-viz-cpal"))]
+          viz: None,
+          #[cfg(feature = "art-decode")]
+          cover_art_full_image_support: false,
+        },
+      );
+    }
+    while let Ok(event) = rx.try_recv() {
+      assert!(!matches!(
+        event,
+        IoEvent::AutomaticPlayback(_) | IoEvent::AdvanceNativeQueue
+      ));
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(resolver.state.lock().unwrap().pending.is_empty());
+  }
+
+  #[tokio::test]
+  async fn stale_queue_advances_release_only_the_original_slots_latch() {
+    use crate::infra::queue::QueueNowPlaying;
+
+    for stale_login in [false, true] {
+      for replacement in [false, true] {
+        for result in [Ok(bundle_constants()), Err(anyhow!("stale failure"))] {
+          let resolver = Arc::new(ConstantsResolver::default());
+          let (app, rx) = app_with_events();
+          let mut guard = app.lock().await;
+          ended_queue(&mut guard);
+          let epoch = auth::token_epoch();
+          assert!(resolver.defer_with(
+            &app,
+            &mut guard,
+            IoEvent::AutomaticPlayback(Box::new(IoEvent::AdvanceNativeQueue)),
+            if stale_login {
+              epoch.wrapping_sub(1)
+            } else {
+              epoch
+            },
+            || async { result }
+          ));
+          if !stale_login {
+            guard.note_playback_intent(&IoEvent::PausePlayback);
+          }
+          if replacement {
+            if let Some(QueueNowPlaying::Decoded(slot)) = guard.queue_now.as_mut() {
+              slot.fetch_id = 2;
+            }
+          }
+          guard.set_status_message("new decision", 30);
+          drop(guard);
+
+          resolution_finishes(&resolver).await;
+
+          let guard = app.lock().await;
+          let Some(QueueNowPlaying::Decoded(slot)) = guard.queue_now.as_ref() else {
+            panic!("cancellation must preserve the slot");
+          };
+          assert_eq!(slot.advancing, replacement);
+          assert_eq!(guard.native_queue.len(), 2, "stale work consumes nothing");
+          assert_eq!(guard.status_message(), Some("new decision"));
+          assert!(rx.try_recv().is_err());
+        }
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn a_newer_deferred_advance_inherits_the_old_slots_latch() {
+    use crate::infra::queue::QueueNowPlaying;
+
+    for stale_later in [false, true] {
+      for failed in [false, true] {
+        let resolver = Arc::new(ConstantsResolver::default());
+        let (app, rx) = app_with_events();
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        let mut guard = app.lock().await;
+        ended_queue(&mut guard);
+        let epoch = auth::token_epoch();
+        assert!(resolver.defer_with(
+          &app,
+          &mut guard,
+          IoEvent::AutomaticPlayback(Box::new(IoEvent::AdvanceNativeQueue)),
+          epoch,
+          || async { wait.await.unwrap() }
+        ));
+        guard.note_playback_intent(&IoEvent::NextTrack);
+        assert!(resolver.defer_with(
+          &app,
+          &mut guard,
+          IoEvent::AdvanceNativeQueue,
+          epoch,
+          || async { panic!("the newer advance shares the pending resolution") }
+        ));
+        if stale_later {
+          guard.note_playback_intent(&IoEvent::PausePlayback);
+        }
+        drop(guard);
+        finish
+          .send(if failed {
+            Err(anyhow!("injected scrape failure"))
+          } else {
+            Ok(bundle_constants())
+          })
+          .unwrap();
+        resolver.ready.notified().await;
+
+        let pending = resolver.next_pending().await;
+        if stale_later {
+          assert!(pending.is_none());
+          let guard = app.lock().await;
+          assert!(
+            matches!(guard.queue_now.as_ref(), Some(QueueNowPlaying::Decoded(slot)) if !slot.advancing)
+          );
+          assert_eq!(guard.native_queue.len(), 2, "stale work consumes nothing");
+        } else if failed {
+          assert!(pending.is_none());
+          let guard = app.lock().await;
+          assert!(
+            guard.queue_now.is_none(),
+            "failure retires the latched slot"
+          );
+          assert!(guard.native_queue.is_empty());
+        } else {
+          let pending = pending.unwrap();
+          assert!(matches!(pending.event, IoEvent::AdvanceNativeQueue));
+          let mut guard = app.lock().await;
+          assert!(
+            matches!(guard.queue_now.as_ref(), Some(QueueNowPlaying::Decoded(slot)) if slot.advancing)
+          );
+          assert_eq!(guard.native_queue.len(), 2);
+          // Clearing the queue during the wait makes replay finish the old
+          // episode without needing a source login or an audio device.
+          guard.clear_native_queue();
+          drop(guard);
+          assert!(crate::infra::queue::dispatch::route_queue_pump_event(
+            &app, &pending.event, true, true,
+          ).await);
+          assert!(
+            app.lock().await.queue_now.is_none(),
+            "replay retires the latch"
+          );
+        }
+        assert!(resolver.next_pending().await.is_none());
+        assert!(rx.try_recv().is_err());
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn dropping_a_parked_start_clears_only_the_preparing_notice() {
+    for stale_login in [false, true] {
+      for later_status in [None, Some("another source is playing")] {
+        for result in [Ok(bundle_constants()), Err(anyhow!("stale failure"))] {
+          let resolver = Arc::new(ConstantsResolver::default());
+          let (app, rx) = app_with_events();
+          let (finish, wait) = tokio::sync::oneshot::channel();
+          let mut guard = app.lock().await;
+          let epoch = auth::token_epoch();
+          // Model the old login's notice without changing the shared token.
+          let preparing = guard.strings().status.infra.qobuz_preparing;
+          guard.set_status_message(preparing, 30);
+          let start = IoEvent::StartPlayback(Some("qobuz:track:waiting".into()), None, None);
+          guard.note_playback_intent(&start);
+          assert!(resolver.defer_with(
+            &app,
+            &mut guard,
+            start,
+            if stale_login {
+              epoch.wrapping_sub(1)
+            } else {
+              epoch
+            },
+            || async { wait.await.unwrap() }
+          ));
+          if !stale_login {
+            guard.dispatch(IoEvent::NextTrack);
+            assert!(matches!(rx.try_recv(), Ok(IoEvent::NextTrack)));
+          }
+          if let Some(message) = later_status {
+            guard.set_status_message(message, 30);
+          }
+          drop(guard);
+          finish.send(result).unwrap();
+          resolution_finishes(&resolver).await;
+          assert!(rx.try_recv().is_err());
+          assert_eq!(app.lock().await.status_message(), later_status);
+        }
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn playback_adjustments_keep_parked_qobuz_starts() {
+    for advance in [false, true] {
+      for event in [
+        IoEvent::ChangeVolume(50),
+        IoEvent::Seek(100),
+        IoEvent::Shuffle(true),
+        IoEvent::Repeat(rspotify::model::RepeatState::Context),
+        IoEvent::TransferPlaybackToDevice("device".into(), false),
+        IoEvent::AutoSelectStreamingDevice("device".into(), false, false),
+        IoEvent::EnsurePlaybackContinues("spotify:track:current".into()),
+        IoEvent::ToggleNativeShuffleSession(true),
+      ] {
+        let resolver = Arc::new(ConstantsResolver::default());
+        let (app, rx) = app_with_events();
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        let mut guard = app.lock().await;
+        let start = if advance {
+          IoEvent::AdvanceNativeQueue
+        } else {
+          IoEvent::StartPlayback(Some("qobuz:track:waiting".into()), None, None)
+        };
+        guard.note_playback_intent(&start);
+        assert!(
+          resolver.defer_with(&app, &mut guard, start, auth::token_epoch(), || async {
+            wait.await.unwrap()
+          })
+        );
+        let generation = guard.playback_intent_generation();
+        guard.dispatch(event);
+        // The pump records direct channel requests as well as App dispatches.
+        let adjustment = rx.try_recv().expect("adjustment reached the pump");
+        guard.note_playback_intent(&adjustment);
+        assert_eq!(guard.playback_intent_generation(), generation);
+        drop(guard);
+        finish.send(Ok(bundle_constants())).unwrap();
+        resolution_finishes(&resolver).await;
+        if advance {
+          assert!(matches!(rx.try_recv(), Ok(IoEvent::AdvanceNativeQueue)));
+        } else {
+          assert!(
+            matches!(rx.try_recv(), Ok(IoEvent::StartPlayback(Some(uri), None, None)) if uri == "qobuz:track:waiting")
+          );
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.lock().await.playback_intent_generation(), generation);
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn a_new_qobuz_start_supersedes_the_old_start_in_the_pending_batch() {
+    let resolver = Arc::new(ConstantsResolver::default());
+    let (app, rx) = app_with_events();
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    let epoch = auth::token_epoch();
+    let mut guard = app.lock().await;
+    let first = IoEvent::StartPlayback(Some("qobuz:track:older".into()), None, None);
+    guard.note_playback_intent(&first);
+    assert!(
+      resolver.defer_with(&app, &mut guard, first, epoch, || async {
+        wait.await.unwrap()
+      })
+    );
+    let newer = IoEvent::StartPlayback(None, Some(vec!["qobuz:track:newer".into()]), Some(0));
+    guard.note_playback_intent(&newer);
+    assert!(
+      resolver.defer_with(&app, &mut guard, newer, epoch, || async {
+        panic!("shared scrape")
+      })
+    );
+    let generation = guard.playback_intent_generation();
+    guard.dispatch(IoEvent::ChangeVolume(50));
+    assert!(matches!(rx.try_recv(), Ok(IoEvent::ChangeVolume(50))));
+    assert!(resolver.defer_with(
+      &app,
+      &mut guard,
+      IoEvent::GetQobuzPlaylists,
+      epoch,
+      || async { panic!("shared scrape") }
+    ));
+    drop(guard);
+    finish.send(Ok(bundle_constants())).unwrap();
+    resolution_finishes(&resolver).await;
+    assert!(
+      matches!(rx.try_recv(), Ok(IoEvent::StartPlayback(None, Some(uris), Some(0))) if uris == ["qobuz:track:newer"])
+    );
+    assert!(matches!(rx.try_recv(), Ok(IoEvent::GetQobuzPlaylists)));
+    assert!(rx.try_recv().is_err());
+    assert_eq!(app.lock().await.playback_intent_generation(), generation);
+  }
+
+  #[tokio::test]
+  async fn direct_playback_decisions_supersede_a_parked_start() {
+    let controls: &[fn(&mut App)] = &[
+      App::toggle_playback,
+      App::next_track,
+      App::previous_track,
+      App::force_previous_track,
+      |app| app.start_playback_uris(vec!["file:///later.mp3".into()], None),
+      |app| app.start_playback_context("radio:https://example.com/live".into(), None),
+      |app| app.play_apple_music_track("applemusic:track:later".into()),
+      |app| app.set_apple_music_playing(false),
+    ];
+    for control in controls {
+      let resolver = Arc::new(ConstantsResolver::default());
+      let (app, rx) = app_with_events();
+      let (finish, wait) = tokio::sync::oneshot::channel();
+      let mut guard = app.lock().await;
+      assert!(resolver.defer_with(
+        &app,
+        &mut guard,
+        IoEvent::AdvanceNativeQueue,
+        auth::token_epoch(),
+        || async { wait.await.unwrap() }
+      ));
+      control(&mut guard);
+      drop(guard);
+      while rx.try_recv().is_ok() {}
+      finish.send(Ok(bundle_constants())).unwrap();
+      resolution_finishes(&resolver).await;
+      assert!(rx.try_recv().is_err());
+    }
+  }
+
+  #[tokio::test]
+  async fn new_arrivals_during_the_ready_batch_stay_behind_older_events() {
+    let resolver = Arc::new(ConstantsResolver::default());
+    let (app, rx) = app_with_events();
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    let epoch = auth::token_epoch();
+    let resolution = resolver.resolve_with(|| async { wait.await.unwrap() });
+    for uri in ["qobuz:album:older", "qobuz:album:second"] {
+      assert!(resolver.defer_with(
+        &app,
+        &mut *app.lock().await,
+        IoEvent::GetQobuzTracks(uri.into()),
+        epoch,
+        || async { panic!("shared scrape") }
+      ));
+    }
+    finish.send(Ok(bundle_constants())).unwrap();
+    assert_eq!(resolution.await.unwrap(), bundle_constants());
+    resolver.ready.notified().await;
+    let first = resolver.next_pending().await.unwrap();
+    assert!(matches!(first.event, IoEvent::GetQobuzTracks(uri) if uri == "qobuz:album:older"));
+    assert!(
+      rx.try_recv().is_err(),
+      "replay must not move to the back of the channel"
+    );
+    assert!(resolver.defer_with(
+      &app,
+      &mut *app.lock().await,
+      IoEvent::GetQobuzTracks("qobuz:album:newer".into()),
+      epoch,
+      || async { panic!("ready constants") }
+    ));
+    // Off-pump work can use the result before the pump finishes the batch.
+    assert_eq!(
+      resolver
+        .resolve_with(|| async { panic!("cached constants") })
+        .await
+        .unwrap(),
+      bundle_constants()
+    );
+    assert!(
+      matches!(resolver.next_pending().await.unwrap().event, IoEvent::GetQobuzTracks(uri) if uri == "qobuz:album:second")
+    );
+    assert!(
+      matches!(resolver.next_pending().await.unwrap().event, IoEvent::GetQobuzTracks(uri) if uri == "qobuz:album:newer")
+    );
+    assert!(resolver.next_pending().await.is_none());
+    assert!(!resolver.defer_with(
+      &app,
+      &mut *app.lock().await,
+      IoEvent::QobuzLogin,
+      epoch,
+      || async { panic!("cached constants") }
+    ));
+  }
+
+  #[tokio::test]
+  async fn a_poisoned_resolver_reports_an_error_without_panicking() {
+    let resolver = Arc::new(ConstantsResolver::default());
+    let to_poison = Arc::clone(&resolver);
+    assert!(std::thread::spawn(move || {
+      let _guard = to_poison.state.lock().expect("unpoisoned state");
+      panic!("injected resolver panic");
+    })
+    .join()
+    .is_err());
+    assert!(resolver
+      .resolve_with(|| async { panic!("must not resolve") })
+      .await
+      .is_err());
+    let (app, rx) = app_with_events();
+    let mut guard = app.lock().await;
+    assert!(resolver.defer_with(
+      &app,
+      &mut guard,
+      IoEvent::QobuzLogin,
+      auth::token_epoch(),
+      || async { panic!("must not resolve") }
+    ));
+    assert!(guard
+      .status_message()
+      .is_some_and(|message| message.contains("Qobuz constants resolver lock poisoned")));
+    assert!(guard.api_error().is_empty());
+    assert!(rx.try_recv().is_err());
+    assert!(resolver.next_pending().await.is_none());
+  }
+
+  #[cfg(feature = "streaming")]
+  #[tokio::test]
+  async fn music_owned_queue_requests_do_not_start_a_constants_lookup() {
+    let (app, rx) = app_with_events();
+    let mut guard = app.lock().await;
+    guard.claim_apple_music();
+    guard
+      .native_queue
+      .push(crate::core::test_helpers::queued_track(
+        "qobuz:track:1",
+        "Queued",
+      ));
+    assert!(!defer_constants(
+      &app,
+      &mut guard,
+      &IoEvent::AdvanceNativeQueue,
+      false
+    ));
+    assert_eq!(guard.status_message(), None);
+    assert!(rx.try_recv().is_err());
+  }
+
+  #[tokio::test]
+  async fn the_first_parked_event_shows_preparation_without_replacing_later_status() {
+    for started_off_pump in [false, true] {
+      let resolver = Arc::new(ConstantsResolver::default());
+      let (app, _rx) = app_with_events();
+      let (finish, wait) = tokio::sync::oneshot::channel();
+      let resolve = || async { wait.await.unwrap() };
+      let epoch = auth::token_epoch();
+      {
+        let mut guard = app.lock().await;
+        if started_off_pump {
+          let _resolution = resolver.resolve_with(resolve);
+          assert!(
+            resolver.defer_with(&app, &mut guard, IoEvent::QobuzLogin, epoch, || async {
+              panic!("the off-pump caller already started the scrape")
+            })
+          );
+        } else {
+          assert!(resolver.defer_with(&app, &mut guard, IoEvent::QobuzLogin, epoch, resolve));
+        }
+        assert_eq!(
+          guard.status_message(),
+          Some(guard.strings().status.infra.qobuz_preparing)
+        );
+        assert!(!guard.status_message_is_error());
+        guard.set_status_message("another source is playing", 30);
+        assert!(resolver.defer_with(
+          &app,
+          &mut guard,
+          IoEvent::GetQobuzPlaylists,
+          epoch,
+          || async { panic!("later events must share the scrape") },
+        ));
+        assert_eq!(guard.status_message(), Some("another source is playing"));
+      }
+      finish.send(Ok(bundle_constants())).unwrap();
+      resolution_finishes(&resolver).await;
+      let mut guard = app.lock().await;
+      assert!(
+        !resolver.defer_with(&app, &mut guard, IoEvent::QobuzLogin, epoch, || async {
+          panic!("ready constants must not be resolved again")
+        })
+      );
+      assert_eq!(guard.status_message(), Some("another source is playing"));
+    }
+  }
+
+  #[tokio::test]
+  async fn waiting_for_constants_returns_before_the_network_and_allows_other_events() {
+    let resolver = Arc::new(ConstantsResolver::default());
+    let (app, rx) = app_with_events();
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    assert!(resolver.defer_with(
+      &app,
+      &mut *app.lock().await,
+      IoEvent::QobuzLogin,
+      auth::token_epoch(),
+      || async { wait.await.unwrap() }
+    ));
+    // The resolver cannot finish until this pump-side call has returned.
+    app.lock().await.dispatch(IoEvent::PausePlayback);
+    assert!(matches!(rx.try_recv(), Ok(IoEvent::PausePlayback)));
+    assert!(rx.try_recv().is_err());
+    finish.send(Ok(bundle_constants())).unwrap();
+    resolution_finishes(&resolver).await;
+    assert!(matches!(rx.try_recv(), Ok(IoEvent::QobuzLogin)));
+    assert!(rx.try_recv().is_err());
+  }
+
+  #[tokio::test]
+  async fn the_preparing_notice_clears_when_the_parked_event_replays() {
+    let resolver = Arc::new(ConstantsResolver::default());
+    let (app, rx) = app_with_events();
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    {
+      let mut guard = app.lock().await;
+      let epoch = auth::token_epoch();
+      assert!(
+        resolver.defer_with(&app, &mut guard, IoEvent::QobuzLogin, epoch, || async {
+          wait.await.unwrap()
+        })
+      );
+      assert_eq!(
+        guard.status_message(),
+        Some(guard.strings().status.infra.qobuz_preparing)
+      );
+    }
+    finish.send(Ok(bundle_constants())).unwrap();
+    resolution_finishes(&resolver).await;
+    assert!(matches!(rx.try_recv(), Ok(IoEvent::QobuzLogin)));
+    assert_eq!(app.lock().await.status_message(), None);
+  }
+
+  #[tokio::test]
+  async fn one_constants_scrape_replays_all_waiting_actions_in_arrival_order() {
+    let resolver = Arc::new(ConstantsResolver::default());
+    let (app, rx) = app_with_events();
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    let calls = Arc::new(AtomicU64::new(0));
+    let calls_for_resolve = Arc::clone(&calls);
+    // An off-pump caller and pump events share the same in-flight result.
+    let resolution = resolver.resolve_with(move || async move {
+      calls_for_resolve.fetch_add(1, Ordering::Relaxed);
+      wait.await.unwrap()
+    });
+    let epoch = auth::token_epoch();
+    for event in [
+      IoEvent::GetQobuzPlaylists,
+      IoEvent::GetQobuzTracks("qobuz:album:1".into()),
+      IoEvent::GetQobuzSearchResults("query".into()),
+      IoEvent::StartPlayback(
+        None,
+        Some(vec!["qobuz:track:1".into(), "qobuz:track:2".into()]),
+        Some(1),
+      ),
+      IoEvent::AdvanceNativeQueue,
+    ] {
+      assert!(
+        resolver.defer_with(&app, &mut *app.lock().await, event, epoch, || async {
+          panic!("a second waiter must not start another scrape")
+        })
+      );
+    }
+    finish.send(Ok(bundle_constants())).unwrap();
+    assert_eq!(resolution.await.unwrap(), bundle_constants());
+    resolution_finishes(&resolver).await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(matches!(rx.try_recv(), Ok(IoEvent::GetQobuzPlaylists)));
+    assert!(matches!(rx.try_recv(), Ok(IoEvent::GetQobuzTracks(uri)) if uri == "qobuz:album:1"));
+    assert!(matches!(rx.try_recv(), Ok(IoEvent::GetQobuzSearchResults(query)) if query == "query"));
+    assert!(
+      matches!(rx.try_recv(), Ok(IoEvent::StartPlayback(None, Some(uris), Some(1)))
+      if uris == ["qobuz:track:1", "qobuz:track:2"])
+    );
+    assert!(matches!(rx.try_recv(), Ok(IoEvent::AdvanceNativeQueue)));
+    assert!(rx.try_recv().is_err());
+    assert!(!resolver.defer_with(
+      &app,
+      &mut *app.lock().await,
+      IoEvent::QobuzLogin,
+      epoch,
+      || async { panic!("ready constants must not be resolved again") }
+    ));
+  }
+
+  #[tokio::test]
+  async fn a_failed_constants_scrape_reports_to_all_waiters_and_allows_a_retry() {
+    let resolver = Arc::new(ConstantsResolver::default());
+    let (first, first_rx) = app_with_events();
+    let (second, second_rx) = app_with_events();
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    let epoch = auth::token_epoch();
+    assert!(resolver.defer_with(
+      &first,
+      &mut *first.lock().await,
+      IoEvent::QobuzLogin,
+      epoch,
+      || async { wait.await.unwrap() }
+    ));
+    assert!(resolver.defer_with(
+      &second,
+      &mut *second.lock().await,
+      IoEvent::GetQobuzPlaylists,
+      epoch,
+      || async { panic!("a failed scrape is shared too") }
+    ));
+    finish
+      .send(Err(anyhow!("injected scrape failure")))
+      .unwrap();
+    resolution_finishes(&resolver).await;
+    for app in [&first, &second] {
+      let app = app.lock().await;
+      let strings = &app.strings().status.infra;
+      let expected =
+        strings.qobuz_operation_failed(strings.qobuz_step_constants, "injected scrape failure");
+      assert_eq!(app.status_message(), Some(expected.as_str()));
+      assert!(app.api_error().is_empty());
+    }
+    assert!(first_rx.try_recv().is_err());
+    assert!(second_rx.try_recv().is_err());
+    assert!(resolver.defer_with(
+      &first,
+      &mut *first.lock().await,
+      IoEvent::QobuzLogin,
+      epoch,
+      || async { Ok(bundle_constants()) }
+    ));
+    resolution_finishes(&resolver).await;
+    assert!(matches!(first_rx.try_recv(), Ok(IoEvent::QobuzLogin)));
+    assert!(first_rx.try_recv().is_err());
+  }
+
+  #[tokio::test]
+  async fn a_stale_constants_wait_neither_replays_an_action_nor_changes_status() {
+    for result in [Ok(bundle_constants()), Err(anyhow!("stale failure"))] {
+      let resolver = Arc::new(ConstantsResolver::default());
+      let (app, rx) = app_with_events();
+      app.lock().await.set_status_message("new login status", 30);
+      let old_epoch = auth::token_epoch().wrapping_sub(1);
+      assert!(resolver.defer_with(
+        &app,
+        &mut *app.lock().await,
+        IoEvent::QobuzLogin,
+        old_epoch,
+        || async { result }
+      ));
+      resolution_finishes(&resolver).await;
+      assert!(rx.try_recv().is_err());
+      assert_eq!(app.lock().await.status_message(), Some("new login status"));
+    }
+  }
+
+  #[tokio::test]
+  async fn cancelling_a_constants_waiter_keeps_the_shared_scrape_running() {
+    let resolver = Arc::new(ConstantsResolver::default());
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    let resolution = resolver.resolve_with(|| async { wait.await.unwrap() });
+    drop(resolution);
+    finish.send(Ok(bundle_constants())).unwrap();
+    resolution_finishes(&resolver).await;
+    assert_eq!(
+      resolver
+        .resolve_with(|| async { panic!("the successful result must be cached") })
+        .await
+        .unwrap(),
+      bundle_constants()
+    );
+  }
 
   #[test]
   fn a_segment_failure_replaces_the_decoder_error() {

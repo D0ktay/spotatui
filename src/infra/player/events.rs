@@ -741,7 +741,7 @@ async fn handle_player_events(
             if let Some(ref mut ctx) = app.current_playback_context {
               ctx.is_playing = false;
             }
-            app.dispatch(IoEvent::PausePlayback);
+            app.dispatch_automatic(IoEvent::PausePlayback);
           }
         }
       }

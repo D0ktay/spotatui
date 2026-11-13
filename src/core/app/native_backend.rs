@@ -294,9 +294,9 @@ impl App {
     match behavior {
       Some(StartupBehavior::Play) => {
         self.dispatch(IoEvent::Shuffle(shuffle));
-        self.dispatch(IoEvent::StartPlayback(None, None, None));
+        self.dispatch_automatic(IoEvent::StartPlayback(None, None, None));
       }
-      Some(StartupBehavior::Pause) => self.dispatch(IoEvent::PausePlayback),
+      Some(StartupBehavior::Pause) => self.dispatch_automatic(IoEvent::PausePlayback),
       Some(StartupBehavior::Continue) | None => {}
     }
   }
@@ -317,7 +317,7 @@ impl App {
       return;
     }
     self.set_status_message(self.strings().status.app.resuming_request, 4);
-    self.dispatch(IoEvent::StartPlayback(
+    self.dispatch_automatic(IoEvent::StartPlayback(
       pending.context_uri,
       pending.uris,
       pending.offset,
@@ -669,11 +669,44 @@ mod tests {
     let (tx, rx) = channel();
     let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
     app.run_spotify_startup_behavior(Some(StartupBehavior::Pause), false);
-    assert!(matches!(rx.try_recv(), Ok(IoEvent::PausePlayback)));
+    assert!(matches!(
+      app.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::PausePlayback
+    ));
     // Music started while Spotify was still starting up: nothing is sent.
     app.claim_apple_music();
     app.run_spotify_startup_behavior(Some(StartupBehavior::Pause), false);
     app.run_spotify_startup_behavior(Some(StartupBehavior::Play), true);
+    assert!(rx.try_recv().is_err());
+  }
+
+  #[test]
+  fn startup_and_recovery_replays_preserve_the_playback_intent() {
+    use crate::core::user_config::StartupBehavior;
+    let (tx, rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), None);
+    app.dispatch(IoEvent::StartPlayback(
+      Some("qobuz:track:waiting".into()),
+      None,
+      None,
+    ));
+    app.prepare_playback_event(rx.try_recv().unwrap());
+    let intent = app.playback_intent_generation;
+
+    for behavior in [StartupBehavior::Play, StartupBehavior::Pause] {
+      app.run_spotify_startup_behavior(Some(behavior), false);
+      while let Ok(event) = rx.try_recv() {
+        app.prepare_playback_event(event);
+      }
+      assert_eq!(app.playback_intent_generation, intent);
+    }
+    app.park_start_playback(Some("spotify:playlist:parked".into()), None, None);
+    app.replay_pending_start_playback();
+    assert!(matches!(
+      app.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(Some(uri), None, None) if uri == "spotify:playlist:parked"
+    ));
+    assert_eq!(app.playback_intent_generation, intent);
     assert!(rx.try_recv().is_err());
   }
 
@@ -771,7 +804,10 @@ mod tests {
 
     app.replay_pending_start_playback();
 
-    assert!(matches!(rx.try_recv(), Ok(IoEvent::StartPlayback(..))));
+    assert!(matches!(
+      app.prepare_playback_event(rx.try_recv().unwrap()),
+      IoEvent::StartPlayback(..)
+    ));
   }
 
   #[test]
